@@ -22,7 +22,13 @@ from docx.oxml.ns import qn, nsdecls
 
 # Constants
 CORE_COLUMNS = ['Program Name', 'Faculty Name', 'Session', 'Category', 'Comments']
-TEXT_KEY_COLUMNS = ['Program Name', 'Faculty Name', 'Session']
+TEXT_KEY_COLUMNS = ['Program Name', 'Faculty Name', 'Session', 'Department']
+DEPT_COL = "Department"  # optional column: which department each programme belongs to
+UNSPECIFIED_SESSION = "Unspecified session"  # label for rows that have no Session value
+SIGNOFF_FILE = "signoff.xlsx"  # Excel file with Name | Position | Sign, kept next to the app
+SIGNATURE_MAX_HEIGHT_IN = 0.6  # default signature picture box in inches: the picture is scaled to fit
+SIGNATURE_MAX_WIDTH_IN = 2.0   # inside it, keeping its proportions
+SIGNATURE_LIMIT_IN = 6.0       # absolute cap so a typo in Excel cannot blow the picture up
 EXCEL_SHEET = "Comments & Scores"
 LOGO_CANDIDATES = ("logo.png", "input_file_0.png", "SBS_Logo.png")
 SCORE_MAX = 5
@@ -30,12 +36,20 @@ EXCEL_BLUE = "#4472C4"
 EXCEL_RED = "#C00000"  # Professional Excel dark red for charts
 CHART_DPI = 150
 
+# Master Departmental Report settings
+RANK_N = 3                       # default number of top / bottom faculty sessions shown
+MAX_COMMENTS_PER_FACULTY = 5     # default cap on comments per session (None = all)
+MIN_RESPONSES_TO_RANK = 3        # sessions with fewer responses are ignored when ranking
+MAX_COMMENT_CHARS = 300          # long comments are trimmed to this length
+
+
 def get_evaluation_params(df):
     """Dynamically detect evaluation parameter columns from the dataframe, excluding metadata and year columns."""
     return [
-        col for col in df.columns 
-        if col not in CORE_COLUMNS 
-        and 'year' not in col.lower() 
+        col for col in df.columns
+        if col not in CORE_COLUMNS
+        and col != DEPT_COL
+        and 'year' not in col.lower()
         and pd.api.types.is_numeric_dtype(df[col])
     ]
 
@@ -56,6 +70,9 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = s.where(s.isna(), s.astype(str).str.strip()).replace("", np.nan)
     return df
 
+def _has_dept(df) -> bool:
+    return DEPT_COL in df.columns and df[DEPT_COL].notna().any()
+
 @st.cache_data(show_spinner="Reading file…")
 def load_uploaded_file(file_bytes: bytes, name: str) -> pd.DataFrame:
     buf = io.BytesIO(file_bytes)
@@ -66,6 +83,18 @@ def load_uploaded_file(file_bytes: bytes, name: str) -> pd.DataFrame:
         raise ValueError(f"Sheet '{EXCEL_SHEET}' not found. Sheets in file: {', '.join(xls.sheet_names)}")
     return clean_dataframe(xls.parse(EXCEL_SHEET, header=1))
 
+def _read_google_csv(export_url):
+    """Read the sheet; if the headers are on the second row (like the Excel layout), retry with header=1."""
+    df = clean_dataframe(pd.read_csv(export_url))
+    if not validate_dataframe(df)[0]:
+        try:
+            alt = clean_dataframe(pd.read_csv(export_url, header=1))
+            if validate_dataframe(alt)[0]:
+                return alt
+        except Exception:
+            pass
+    return df
+
 @st.cache_data(show_spinner="Fetching Google Sheet…", ttl=300)
 def load_google_sheet(sheet_url: str):
     match = re.search(r"/d/([a-zA-Z0-9-_]+)", sheet_url)
@@ -75,7 +104,7 @@ def load_google_sheet(sheet_url: str):
     gid = gid_match.group(1) if gid_match else "0"
     export_url = f"https://docs.google.com/spreadsheets/d/{match.group(1)}/export?format=csv&gid={gid}"
     try:
-        return clean_dataframe(pd.read_csv(export_url)), None
+        return _read_google_csv(export_url), None
     except Exception as e:
         return None, str(e)
 
@@ -101,6 +130,7 @@ class DeptResult:
     avg_score: float
     comments: list
     chart: bytes = b""
+    respondents: int = 0
 
 @dataclass
 class ProgrammeResult:
@@ -108,22 +138,126 @@ class ProgrammeResult:
     dept: list = field(default_factory=list)
     highest_session_respondents: int = 0
 
+@dataclass
+class Signatory:
+    name: str = ""
+    title: str = ""
+    signature: bytes = b""   # image of the signature (picture placed in the Sign cell)
+    sign_text: str = ""      # or a typed signature
+    sign_width: float = 0.0  # optional picture width in inches (0 = automatic)
+    sign_height: float = 0.0 # optional picture height in inches (0 = automatic)
+
+def _num(value) -> float:
+    try:
+        number = float(str(value).replace(",", ".").strip())
+        if number <= 0:
+            return 0.0
+        return min(number, SIGNATURE_LIMIT_IN)
+    except (TypeError, ValueError):
+        return 0.0
+
+def read_signoffs(source) -> list:
+    """Read the sign-off Excel. Headers in row 1: Name | Position | Sign (one row per person).
+    The Sign cell can hold typed text, or a picture placed on that row."""
+    from openpyxl import load_workbook
+    try:
+        wb = load_workbook(source)
+    except Exception as exc:
+        raise ValueError("The sign-off file could not be opened as a valid Excel workbook.") from exc
+    ws = next((wb[n] for n in wb.sheetnames if n.strip().lower().replace(" ", "").replace("-", "") == "signoff"),
+              wb.active)
+
+    cols = {}
+    for c in ws[1]:
+        h = re.sub(r"\(.*?\)", "", str(c.value or "").strip().lower()).strip()   # ignore "(in)" etc.
+        if h == "name":
+            cols["name"] = c.column
+        elif h in ("position", "title", "role", "designation"):
+            cols["title"] = c.column
+        elif h in ("sign", "signature"):
+            cols["sign"] = c.column
+        elif h in ("sign width", "signature width", "width"):
+            cols["w"] = c.column
+        elif h in ("sign height", "signature height", "height"):
+            cols["h"] = c.column
+    if "name" not in cols:
+        raise ValueError("Row 1 needs the headers: Name, Position, Sign")
+    # pictures, matched to the row they are placed on
+    pics = {}
+    for img in getattr(ws, "_images", []):
+        try:
+            anchor = img.anchor
+            row = (anchor._from.row + 1) if hasattr(anchor, "_from") else None
+            data = img._data()
+            if row is not None and data:
+                pics.setdefault(row, data)
+        except Exception:
+            continue
+
+    people = []
+    for r in range(2, ws.max_row + 1):
+        name = str(ws.cell(r, cols["name"]).value or "").strip()
+        title = str(ws.cell(r, cols["title"]).value or "").strip() if "title" in cols else ""
+        text = str(ws.cell(r, cols["sign"]).value or "").strip() if "sign" in cols else ""
+        if not (name or title or text or r in pics):
+            continue
+        people.append(Signatory(
+            name, title, pics.get(r, b""), text,
+            _num(ws.cell(r, cols["w"]).value) if "w" in cols else 0.0,
+            _num(ws.cell(r, cols["h"]).value) if "h" in cols else 0.0))
+    return people
+
+def signoff_template_bytes() -> bytes:
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sign-off"
+    ws.append(["Name", "Position", "Sign", "Sign Width (in)", "Sign Height (in)"])
+    ws.append(["Jane Doe", "Head of Quality Assurance", "Jane D.", None, None])
+    ws["G1"] = "Notes"
+    ws["G2"] = "Sign Width / Height are optional (inches) and only apply to a signature picture."
+    ws["G3"] = "Fill one to keep the proportions, or both to set the exact size. Leave empty for the default size."
+    ws.column_dimensions["G"].width = 90
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 34
+    ws.column_dimensions["C"].width = 28
+    ws.column_dimensions["D"].width = 18
+    ws.column_dimensions["E"].width = 18
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
 # Helper functions
 def _to_pct(x):
     return (x / SCORE_MAX * 100).round(0)
 
+def _pct_str(x):
+    return f"{int(round(x))}%" if pd.notna(x) else "N/A"
+
+def _fmt_count(n):
+    """Headcounts that were not entered show as 'Not provided'."""
+    return str(int(n)) if n is not None and pd.notna(n) else "Not provided"
+
+def _max_session_responses(prog_df: pd.DataFrame) -> int:
+    """Largest number of responses in any one session, counting faculty AND department sessions."""
+    sizes = []
+    for part in (prog_df[prog_df["Faculty Name"].notna()], prog_df[prog_df["Faculty Name"].isna()]):
+        if not part.empty:
+            sizes.append(int(part.groupby("Session").size().max()))
+    return max(sizes) if sizes else 0
+
 # Analysis functions
 def analyse_programme(prog_df: pd.DataFrame, param_cols: list) -> ProgrammeResult:
     result = ProgrammeResult()
+    result.highest_session_respondents = _max_session_responses(prog_df)
     fac_rows = prog_df[prog_df["Faculty Name"].notna()]
     other_rows = prog_df[prog_df["Faculty Name"].isna()]
 
     if not fac_rows.empty:
-        grouped = fac_rows.groupby(["Session", "Faculty Name"])
+        grouped = fac_rows.groupby(["Session", "Faculty Name"], sort=False)   # sheet order
         scores = _to_pct(grouped[param_cols].mean())
         prog_avg = scores.mean().round(0)
         score_rows = scores.to_dict("index")
-        result.highest_session_respondents = int(fac_rows.groupby("Session").size().max())
 
         for (session, faculty), group in grouped:
             row = score_rows[(session, faculty)]
@@ -138,13 +272,14 @@ def analyse_programme(prog_df: pd.DataFrame, param_cols: list) -> ProgrammeResul
                 comments=group["Comments"].dropna().tolist(),
             ))
 
-    for session, group in other_rows.groupby("Session"):
+    for session, group in other_rows.groupby("Session", sort=False):   # sheet order
         params = [p for p in param_cols if group[p].notna().any()]
         ind = _to_pct(group[params].mean()).tolist() if params else []
         result.dept.append(DeptResult(
             session=str(session), params=params, scores=ind,
             avg_score=round(sum(ind) / len(ind), 0) if ind else 0,
             comments=group["Comments"].dropna().tolist(),
+            respondents=len(group),
         ))
     return result
 
@@ -160,7 +295,7 @@ def render_chart(params, series, title, series_labels, colors=None) -> bytes:
 
     x = np.arange(len(params))
     bar_w = 0.5 / n
-    
+
     valid_series = [np.asarray(s, dtype=float) for s in series if len(s) > 0]
     if valid_series:
         all_vals = np.concatenate(valid_series)
@@ -172,9 +307,9 @@ def render_chart(params, series, title, series_labels, colors=None) -> bytes:
     for i, scores in enumerate(series):
         offset = (i - (n - 1) / 2) * bar_w
         bars = ax.bar(x + offset, scores, bar_w, color=colors[i % len(colors)], label=series_labels[i], edgecolor='white', linewidth=1)
-        
+
         formatted_labels = [
-            f"{int(round(v))}%" if (pd.notna(v) and not np.isnan(v)) else "0%" 
+            f"{int(round(v))}%" if (pd.notna(v) and not np.isnan(v)) else "0%"
             for v in scores
         ]
         ax.bar_label(bars, labels=formatted_labels, padding=4, fontsize=9, fontweight='bold')
@@ -292,7 +427,7 @@ def add_score_table(doc, params, scores, avg, prog_avgs=None, avg_prog=None, avg
     for idx, name in enumerate(params):
         row_cells = table.add_row().cells
         bg_color = "F9FAFC" if idx % 2 == 1 else "FFFFFF"
-        
+
         for cell in row_cells:
             set_cell_background(cell, bg_color)
             set_cell_margins(cell, top=100, bottom=100, start=180, end=180)
@@ -319,6 +454,27 @@ def add_score_table(doc, params, scores, avg, prog_avgs=None, avg_prog=None, avg
         avg_prog_val = f"{int(round(avg_prog))}%" if pd.notna(avg_prog) else "0%"
         _fill(total_cells[2], avg_prog_val, bold=True, center=True, size=9.5)
 
+def add_styled_table(doc, headers, rows):
+    """Generic table with the same navy header and zebra striping as add_score_table."""
+    table = doc.add_table(rows=1, cols=len(headers))
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    for i, cell in enumerate(table.rows[0].cells):
+        set_cell_background(cell, "1F4E78")
+        set_cell_margins(cell, top=140, bottom=140, start=180, end=180)
+        p = cell.paragraphs[0]
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT if i == 0 else WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run(headers[i])
+        run.bold = True
+        run.font.size = Pt(10)
+        run.font.color.rgb = RGBColor(255, 255, 255)
+    for idx, row in enumerate(rows):
+        cells = table.add_row().cells
+        bg = "F9FAFC" if idx % 2 else "FFFFFF"
+        for j, (cell, val) in enumerate(zip(cells, row)):
+            set_cell_background(cell, bg)
+            set_cell_margins(cell, top=100, bottom=100, start=180, end=180)
+            _fill(cell, val, size=9, center=j > 0)
+
 def add_comments(doc, comments, level):
     doc.add_heading("Comments & Feedback", level=level)
     if comments:
@@ -327,45 +483,124 @@ def add_comments(doc, comments, level):
     else:
         doc.add_paragraph("No comments recorded.")
 
-def add_signature(doc, recipient_name=None, recipient_title=None):
-    doc.add_paragraph("\nSUBMITTED THROUGH:")
-    doc.add_paragraph("SBS Evaluation Automation System")
-    doc.add_paragraph("\nName: __________________________")
-    doc.add_paragraph("Title: __________________________")
-    doc.add_paragraph("Sign: __________________________")
+def _signature_size(img_bytes, width_in=0.0, height_in=0.0):
+    """Width and height (inches) for the pasted signature.
+    Only one of width/height given: the other follows the picture's proportions.
+    Both given: used as is. Neither: scaled to fit inside the default box, proportions kept."""
+    try:
+        from PIL import Image as PILImage
+        with PILImage.open(io.BytesIO(img_bytes)) as im:
+            ratio = im.size[0] / im.size[1]
+    except Exception:
+        ratio = None
+    if ratio is None:                                   # cannot read the picture: fixed height, automatic width
+        return None, (height_in or SIGNATURE_MAX_HEIGHT_IN)
+    if width_in and height_in:
+        w, h = width_in, height_in
+    elif height_in:
+        w, h = height_in * ratio, height_in
+    elif width_in:
+        w, h = width_in, width_in / ratio
+    else:
+        h = SIGNATURE_MAX_HEIGHT_IN
+        w = h * ratio
+        if w > SIGNATURE_MAX_WIDTH_IN:
+            w = SIGNATURE_MAX_WIDTH_IN
+            h = w / ratio
+    scale = min(1.0, SIGNATURE_LIMIT_IN / max(w, h))     # never larger than the cap
+    return w * scale, h * scale
+
+def add_signature(doc, signatory=None):
+    """Sign-off block. Name / Title / Sign are filled from the sign-off details; blank lines if none were given."""
+    s = signatory or Signatory()
+    blank = "__________________________"
+    doc.add_paragraph()
+    doc.add_heading("SUBMITTED THROUGH:", level=2)
+
+    table = doc.add_table(rows=1, cols=3)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = False
+    widths = (Inches(2.2), Inches(2.2), Inches(2.2))
+    headers = ("Name", "Title", "Sign")
+    for idx, (cell, width, header) in enumerate(zip(table.rows[0].cells, widths, headers)):
+        cell.width = width
+        set_cell_margins(cell, top=100, bottom=100, start=120, end=120)
+        p = cell.paragraphs[0]
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run(header)
+        run.bold = True
+
+    row = table.add_row()
+    name_cell, title_cell, sign_cell = row.cells
+    for cell, width in zip(row.cells, widths):
+        cell.width = width
+        set_cell_margins(cell, top=100, bottom=100, start=120, end=120)
+
+    name_p = name_cell.paragraphs[0]
+    name_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    name_p.add_run(s.name or blank)
+    title_p = title_cell.paragraphs[0]
+    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title_p.add_run(s.title or blank)
+
+    p = sign_cell.paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    placed = False
+    if s.signature:
+        try:
+            w, h = _signature_size(s.signature, s.sign_width, s.sign_height)
+            p.add_run().add_picture(io.BytesIO(s.signature),
+                                    width=Inches(w) if w else None, height=Inches(h))
+            placed = True
+        except Exception:
+            placed = False
+    if not placed and s.sign_text:
+        run = p.add_run(s.sign_text)
+        run.italic = True
+        run.font.size = Pt(14)
+        placed = True
+    if not placed:
+        p.add_run(blank)
     doc.add_paragraph(f"Date: {datetime.now().strftime('%B %d, %Y')}")
 
 def add_faculty_content(doc, fr: FacultyResult, pic_width, comment_level):
     if fr.params:
         add_score_table(doc, fr.params, fr.scores, fr.avg_score, fr.prog_avgs, fr.avg_prog)
-        doc.add_paragraph()
-        doc.add_picture(io.BytesIO(fr.chart), width=Inches(pic_width))
+        if len(fr.params) > 1 and fr.chart:   # a one-bar chart adds nothing the table doesn't say
+            doc.add_paragraph()
+            doc.add_picture(io.BytesIO(fr.chart), width=Inches(pic_width))
     elif not fr.comments:
         doc.add_paragraph("No evaluation data available for this session.")
     add_comments(doc, fr.comments, comment_level)
 
 # Report builders
-def build_faculty_report(programme, fr: FacultyResult, session_participants) -> bytes:
+def build_faculty_report(programme, fr: FacultyResult, session_participants, signatory=None,
+                         include_signoff=True) -> bytes:
     doc = new_doc()
     add_title(doc, "FACULTY EVALUATION")
     doc.add_paragraph(f"Programme Name: {programme}")
     doc.add_paragraph(f"Session: {fr.session}")
     doc.add_paragraph(f"Faculty Name: {fr.faculty}")
     doc.add_paragraph(f"No. of Respondents: {fr.respondents}")
-    doc.add_paragraph(f"No. of Participants: {session_participants}")
+    doc.add_paragraph(f"No. of Participants: {_fmt_count(session_participants)}")
     add_faculty_content(doc, fr, 6.5, 2)
-    add_signature(doc)
+    if include_signoff:
+        add_signature(doc, signatory)
     return doc_to_bytes(doc)
 
-def build_overall_report(programme, res: ProgrammeResult, total_participants) -> bytes:
+def build_overall_report(programme, res: ProgrammeResult, total_participants, dept_headcounts=None,
+                         signatory=None, include_signoff=True) -> bytes:
     doc = new_doc()
     highest = res.highest_session_respondents
-    pct_resp = round(highest / total_participants * 100) if total_participants > 0 else 0
+    if total_participants:
+        pct_resp = f"{min(100, round(highest / total_participants * 100))}%"   # never above 100%
+    else:
+        pct_resp = "Not available (participants not provided)"
 
     add_title(doc, f"OVERALL PROGRAMME EVALUATION REPORT\n{programme}")
     doc.add_paragraph(f"No. of Respondents: {highest}")
-    doc.add_paragraph(f"No. of Participants: {total_participants}")
-    doc.add_paragraph(f"Response Rate: {pct_resp}%")
+    doc.add_paragraph(f"No. of Participants: {_fmt_count(total_participants)}")
+    doc.add_paragraph(f"Response Rate: {pct_resp}")
     doc.add_paragraph("-" * 50)
 
     if res.faculty:
@@ -379,65 +614,182 @@ def build_overall_report(programme, res: ProgrammeResult, total_participants) ->
         doc.add_heading("Department Reports", level=1)
         for d in res.dept:
             doc.add_heading(d.session, level=2)
+            line = f"No. of Respondents: {d.respondents}"
+            headcount = (dept_headcounts or {}).get(d.session)
+            if headcount:
+                rate = min(100, round(d.respondents / headcount * 100))
+                line += f"  |  No. of Participants: {int(headcount)}  |  Response Rate: {rate}%"
+            doc.add_paragraph(line)
             if d.params:
                 add_score_table(doc, d.params, d.scores, d.avg_score, avg_label="Average score")
-                doc.add_paragraph()
-                doc.add_picture(io.BytesIO(d.chart), width=Inches(6.5))
+                if len(d.params) > 1 and d.chart:   # skip the chart when there is only one parameter
+                    doc.add_paragraph()
+                    doc.add_picture(io.BytesIO(d.chart), width=Inches(6.5))
             add_comments(doc, d.comments, 3)
             doc.add_page_break()
 
-    add_signature(doc)
+    if include_signoff:
+        add_signature(doc, signatory)
     return doc_to_bytes(doc)
 
-def build_master_report(df: pd.DataFrame, param_cols: list) -> bytes:
+# Master Departmental Report (high-level summary for directors and heads)
+def _rank_faculty(fac, param_cols, rank_n=RANK_N):
+    """Rank each (Programme, Session, Faculty) on overall % score. Returns (top, bottom)."""
+    keys = ["Program Name", "Session", "Faculty Name"]
+    g = fac.groupby(keys)
+    stats = pd.DataFrame({
+        "score": g[param_cols].mean().mean(axis=1) / SCORE_MAX * 100,
+        "responses": g.size(),
+    }).dropna(subset=["score"])
+
+    eligible = stats[stats["responses"] >= MIN_RESPONSES_TO_RANK]
+    if len(eligible) < 2 * rank_n:      # too few sessions to apply the threshold
+        eligible = stats
+    eligible = eligible.sort_values("score", ascending=False)
+
+    top = eligible.head(rank_n)
+    bottom = eligible.drop(top.index).tail(rank_n).sort_values("score")  # worst first
+    return top, bottom
+
+def _add_faculty_block(doc, key, row, fac, max_comments=MAX_COMMENTS_PER_FACULTY):
+    prog, session, name = key
+    doc.add_heading(f"{name}: {_pct_str(row['score'])}", level=3)
+    doc.add_paragraph(f"{prog}  |  {session}  |  {int(row['responses'])} responses")
+
+    mask = ((fac["Program Name"] == prog) & (fac["Session"] == session)
+            & (fac["Faculty Name"] == name))
+    comments = fac.loc[mask, "Comments"].dropna().astype(str).tolist()
+    if not comments:
+        doc.add_paragraph("No comments recorded.")
+        return
+    shown = comments if max_comments is None else comments[:max_comments]
+    for c in shown:
+        c = c if len(c) <= MAX_COMMENT_CHARS else c[:MAX_COMMENT_CHARS].rstrip() + "…"
+        doc.add_paragraph(c, style="List Bullet")
+    if len(comments) > len(shown):
+        doc.add_paragraph(f"+ {len(comments) - len(shown)} more comments not shown.")
+
+def build_master_report(df, param_cols, rank_n=RANK_N, max_comments=MAX_COMMENTS_PER_FACULTY,
+                        include_support=True, include_chart=True, scope_label=None, signatory=None) -> bytes:
     fac = df[df["Faculty Name"].notna()]
+    support = df[df["Faculty Name"].isna()] if include_support else df.iloc[0:0]
     doc = new_doc()
-    add_title(doc, "STRATHMORE BUSINESS SCHOOL\nMASTER DEPARTMENTAL EVALUATION REPORT")
-    doc.add_paragraph(f"Total Department Records Analyzed: {len(df)}")
-    doc.add_paragraph(f"Total Active Programs: {df['Program Name'].nunique()}")
-    doc.add_paragraph("-" * 50)
 
-    doc.add_heading("1. Program-Level Benchmarks", level=1)
-    if not fac.empty:
-        prog_score = (fac.groupby("Program Name")[param_cols].mean().mean(axis=1) / SCORE_MAX * 100).round(1)
-        valid_prog_score = prog_score.dropna()
-        if not valid_prog_score.empty:
-            n_sessions = fac.drop_duplicates(["Program Name", "Session", "Faculty Name"]).groupby("Program Name").size()
-            n_resp = fac.groupby("Program Name").size()
+    title = "STRATHMORE BUSINESS SCHOOL\nMASTER DEPARTMENTAL EVALUATION REPORT"
+    if scope_label:
+        title += f"\n{scope_label}"
+    add_title(doc, title)
 
-            table = doc.add_table(rows=1, cols=4)
-            table.alignment = WD_TABLE_ALIGNMENT.CENTER
-            for cell, h in zip(table.rows[0].cells, ["Programme", "Overall Average (%)", "Faculty Sessions", "Responses"]):
-                _fill(cell, h, bold=True, size=10, center=True)
-            for prog, score in prog_score.items():
-                if pd.notna(score):
-                    cells = table.add_row().cells
-                    _fill(cells[0], prog)
-                    _fill(cells[1], f"{score}", center=True)
-                    _fill(cells[2], int(n_sessions[prog]), center=True)
-                    _fill(cells[3], int(n_resp[prog]), center=True)
-        else:
-            doc.add_paragraph("No numeric evaluation data available for program-level benchmarks.")
-
-        doc.add_heading("2. Departmental Parameter Averages (%)", level=1)
-        glob = _to_pct(fac[param_cols].mean()).dropna()
-        if not glob.empty:
-            add_score_table(doc, glob.index.tolist(), glob.tolist(), round(glob.mean(), 0), avg_label="Overall average")
-            doc.add_paragraph()
-            png = render_chart(glob.index.tolist(), [glob.tolist()], "All Programmes : Departmental Parameter Averages",
-                               ["Department Average"], [EXCEL_BLUE])
-            doc.add_picture(io.BytesIO(png), width=Inches(6.5))
-        else:
-            doc.add_paragraph("No numeric evaluation data available for departmental averages.")
-    else:
+    if fac.empty:
         doc.add_paragraph("No faculty evaluation records found.")
+        return doc_to_bytes(doc)
 
-    add_signature(doc)
+    has_dept = _has_dept(df)
+    n_depts = df[DEPT_COL].nunique() if has_dept else 0
+    prog_dept = (df.dropna(subset=[DEPT_COL]).groupby("Program Name")[DEPT_COL].first()
+                 if has_dept else pd.Series(dtype=object))
+
+    glob = _to_pct(fac[param_cols].mean()).dropna()
+    prog_avg = (fac.groupby("Program Name")[param_cols].mean().mean(axis=1)
+                / SCORE_MAX * 100).dropna().sort_values(ascending=False)
+    n_resp = fac.groupby("Program Name").size()
+    support_avg = (support.groupby("Program Name")[param_cols].mean().mean(axis=1) / SCORE_MAX * 100
+                   if not support.empty else pd.Series(dtype=float))
+
+    dept_avg = pd.Series(dtype=float)
+    if n_depts > 1:
+        dept_avg = (fac.groupby(DEPT_COL)[param_cols].mean().mean(axis=1)
+                    / SCORE_MAX * 100).dropna().sort_values(ascending=False)
+
+    top, bottom = _rank_faculty(fac, param_cols, rank_n)
+    mixed = sorted(set(top.index.get_level_values("Faculty Name"))
+                   & set(bottom.index.get_level_values("Faculty Name")))
+
+    # 1. Snapshot
+    doc.add_heading("Snapshot", level=1)
+    snap = [datetime.now().strftime('%B %d, %Y')]
+    if n_depts:
+        snap.append(f"{n_depts} department{'s' if n_depts != 1 else ''}")
+    snap += [f"{df['Program Name'].nunique()} programmes",
+             f"{len(fac)} faculty responses",
+             f"Overall faculty score: {_pct_str(glob.mean())}"]
+    doc.add_paragraph("  |  ".join(snap))
+
+    # 2. Highlights
+    doc.add_heading("Highlights", level=1)
+    if len(dept_avg) > 1:
+        doc.add_paragraph(f"Top department: {dept_avg.index[0]} ({_pct_str(dept_avg.iloc[0])})",
+                          style="List Bullet")
+        doc.add_paragraph(f"Needs most attention (department): {dept_avg.index[-1]} ({_pct_str(dept_avg.iloc[-1])})",
+                          style="List Bullet")
+    if not prog_avg.empty:
+        doc.add_paragraph(f"Top programme: {prog_avg.index[0]} ({_pct_str(prog_avg.iloc[0])})",
+                          style="List Bullet")
+        if len(prog_avg) > 1:
+            doc.add_paragraph(f"Needs most attention (programme): {prog_avg.index[-1]} ({_pct_str(prog_avg.iloc[-1])})",
+                              style="List Bullet")
+    if not glob.empty:
+        ranked = glob.sort_values(ascending=False)
+        doc.add_paragraph(f"Strongest parameter: {ranked.index[0]} ({_pct_str(ranked.iloc[0])})",
+                          style="List Bullet")
+        doc.add_paragraph(f"Weakest parameter: {ranked.index[-1]} ({_pct_str(ranked.iloc[-1])})",
+                          style="List Bullet")
+    if pd.notna(support_avg.mean()):
+        doc.add_paragraph(f"Support services average: {_pct_str(support_avg.mean())}", style="List Bullet")
+    if mixed:
+        doc.add_paragraph(
+            f"Mixed results: {', '.join(mixed)} appear in both the top and bottom lists "
+            f"(strong in one session, weak in another).", style="List Bullet")
+
+    # 3. Department scores (only when more than one department is in the report)
+    if len(dept_avg) > 1:
+        doc.add_heading("Department Scores", level=1)
+        n_prog_by_dept = fac.groupby(DEPT_COL)["Program Name"].nunique()
+        n_resp_by_dept = fac.groupby(DEPT_COL).size()
+        rows = [[d, _pct_str(s), int(n_prog_by_dept.get(d, 0)), int(n_resp_by_dept.get(d, 0))]
+                for d, s in dept_avg.items()]
+        add_styled_table(doc, ["Department", "Faculty Score", "Programmes", "Responses"], rows)
+
+    # 4. Programme league table
+    doc.add_heading("Programme Scores", level=1)
+    headers = ["Programme"] + (["Department"] if n_depts > 1 else []) + ["Faculty Score", "Responses"]
+    if include_support:
+        headers.append("Support Score")
+    rows = []
+    for p, s in prog_avg.items():
+        r = [p]
+        if n_depts > 1:
+            r.append(prog_dept.get(p, ""))
+        r += [_pct_str(s), int(n_resp.get(p, 0))]
+        if include_support:
+            r.append(_pct_str(support_avg.get(p, np.nan)))
+        rows.append(r)
+    add_styled_table(doc, headers, rows)
+
+    # 5. One chart (skipped when there is only one parameter)
+    if include_chart and len(glob) > 1:
+        doc.add_paragraph()
+        png = render_chart(glob.index.tolist(), [glob.tolist()],
+                           "Faculty Evaluation: Average by Parameter",
+                           ["Average"], [EXCEL_BLUE])
+        doc.add_picture(io.BytesIO(png), width=Inches(6.0))
+
+    # 6. Top / bottom sessions with comments
+    doc.add_heading(f"Top {len(top)} Faculty Sessions", level=1)
+    for key, row in top.iterrows():
+        _add_faculty_block(doc, key, row, fac, max_comments)
+    if not bottom.empty:
+        doc.add_heading(f"Bottom {len(bottom)} Faculty Sessions", level=1)
+        for key, row in bottom.iterrows():
+            _add_faculty_block(doc, key, row, fac, max_comments)
+
+    if signatory:
+        add_signature(doc, signatory)
     return doc_to_bytes(doc)
 
 # Batch generation (in-memory, guaranteed valid ZIP structure)
 def generate_programme_zip(df, programmes, participants, totals, gen_overall, gen_individual,
-                           param_cols, on_progress=None) -> bytes:
+                           param_cols, on_progress=None, signatory=None, include_signoff=True) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         used_folders = set()
@@ -446,14 +798,14 @@ def generate_programme_zip(df, programmes, participants, totals, gen_overall, ge
             res = analyse_programme(prog_df, param_cols)
             folder = _unique(safe_name(prog, 80), used_folders)
 
-            # Render charts once, share between reports
+            # Render charts once, share between reports (no chart when a session has only one parameter)
             for fr in res.faculty:
-                if fr.params:
+                if len(fr.params) > 1:
                     fr.chart = render_chart(fr.params, [fr.scores, fr.prog_avgs],
                                             f"{fr.session} : {fr.faculty}", ["Individual", "Programme Avg"])
             if gen_overall:
                 for d in res.dept:
-                    if d.params:
+                    if len(d.params) > 1:
                         d.chart = render_chart(d.params, [d.scores], f"{d.session} : Department Evaluation",
                                                ["Department Score"], [EXCEL_BLUE])
 
@@ -461,19 +813,21 @@ def generate_programme_zip(df, programmes, participants, totals, gen_overall, ge
                 used_files = set()
                 for fr in res.faculty:
                     key = f"{prog} -- {fr.faculty} -- {fr.session}"
-                    session_headcount = participants.get(key, fr.respondents)
-                    data = build_faculty_report(prog, fr, session_headcount)
+                    session_headcount = participants.get(key)
+                    data = build_faculty_report(prog, fr, session_headcount, signatory, include_signoff)
                     fname = _unique(f"{safe_name(fr.faculty)}_{safe_name(fr.session)}.docx", used_files)
                     zf.writestr(f"{folder}/Faculty_Reports/{fname}", data)
 
             if gen_overall:
-                total_headcount = totals.get(prog, res.highest_session_respondents)
-                data = build_overall_report(prog, res, total_headcount)
+                total_headcount = totals.get(prog)
+                dept_headcounts = {d.session: participants.get(f"{prog} -- Dept -- {d.session}")
+                                   for d in res.dept}
+                data = build_overall_report(prog, res, total_headcount, dept_headcounts, signatory, include_signoff)
                 zf.writestr(f"{folder}/{folder}_Overall_Programme_Report.docx", data)
 
             if on_progress:
                 on_progress((idx + 1) / len(programmes), prog)
-    
+
     # Ensure stream pointer is reset to start
     buf.seek(0)
     return buf.getvalue()
@@ -523,78 +877,202 @@ def ingest():
         st.warning("Available columns: " + ", ".join(df.columns.tolist()))
         return None
     st.success(ok_msg)
+
+    # Data-quality checks so responses never disappear silently
+    n_no_prog = int(df["Program Name"].isna().sum())
+    if n_no_prog:
+        st.warning(f"{n_no_prog} rows have no Program Name and will be ignored.")
+    n_no_session = int(df.loc[df["Program Name"].notna(), "Session"].isna().sum())
+    if n_no_session:
+        st.warning(f"{n_no_session} rows have no Session. They are kept under "
+                   f"'{UNSPECIFIED_SESSION}' so their responses and comments are not lost.")
+        df = df.copy()
+        df["Session"] = df["Session"].fillna(UNSPECIFIED_SESSION)
+
     show_preview(df)
+    fingerprint = pd.util.hash_pandas_object(df, index=True).sum()
+    fingerprint = f"{source}:{fingerprint}"
+    if st.session_state.get("_evaluation_input_fingerprint") != fingerprint:
+        st.session_state["_evaluation_input_fingerprint"] = fingerprint
+        st.session_state.pop("prog_zip", None)
+        st.session_state.pop("master_out", None)
     return df
 
-def single_programme_mode(df, param_cols):
-    programmes = sorted(df["Program Name"].dropna().unique().tolist())
+def signoff_form() -> Signatory:
+    """Reads Name / Position / Sign from signoff.xlsx (next to the app), or from an Excel uploaded here."""
+    signoff_fingerprint = ""
+    with st.expander("✍️ Sign-off (Name, Position, Sign)"):
+        up = st.file_uploader("Sign-off Excel (optional: overrides signoff.xlsx for this session)",
+                              type=["xlsx"], key="so_file")
+        people = []
+        try:
+            if up is not None:
+                people = read_signoffs(io.BytesIO(up.getvalue()))
+                signoff_fingerprint = f"upload:{hash(up.getvalue())}"
+                st.caption("Using the uploaded sign-off file.")
+            elif os.path.exists(SIGNOFF_FILE):
+                people = read_signoffs(SIGNOFF_FILE)
+                signoff_fingerprint = f"file:{os.path.getmtime(SIGNOFF_FILE)}"
+                st.caption(f"Using {SIGNOFF_FILE}.")
+            else:
+                st.caption(f"No {SIGNOFF_FILE} found next to the app, so reports will have blank lines to sign by hand.")
+        except Exception as e:
+            st.error(f"Could not read the sign-off file: {e}")
+
+        st.download_button("📄 Download blank sign-off template", signoff_template_bytes(),
+                           file_name="signoff.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        chosen = Signatory()
+        if people:
+            labels = {i: f"{p.name} — {p.title}".strip(" —") for i, p in enumerate(people)}
+            labels[-1] = "No one (leave blank to sign by hand)"
+            pick = st.selectbox("Who signs these reports?", [-1] + list(range(len(people))),
+                                index=1, format_func=lambda i: labels[i], key="so_pick")
+            if pick >= 0:
+                chosen = people[pick]
+                how = "signature image" if chosen.signature else ("typed signature" if chosen.sign_text else "blank line")
+                st.caption(f"Sign: {how}")
+                signoff_fingerprint += f":{pick}"
+            else:
+                signoff_fingerprint += ":none"
+    if st.session_state.get("_signoff_fingerprint") != signoff_fingerprint:
+        st.session_state["_signoff_fingerprint"] = signoff_fingerprint
+        st.session_state.pop("prog_zip", None)
+        st.session_state.pop("master_out", None)
+    return chosen
+
+def _count_input(label, key):
+    """Headcount box that starts empty; returns None until the user fills it in."""
+    val = st.number_input(label, min_value=1, value=None, step=1, key=key)
+    return int(val) if val is not None else None
+
+def single_programme_mode(df, param_cols, signatory=None):
+    programmes = df["Program Name"].dropna().unique().tolist()   # order of the sheet
     selected = st.multiselect("Select Programmes:", options=programmes, default=[])
+    single_input_key = repr(selected)
+    if st.session_state.get("_single_selection_key") != single_input_key:
+        st.session_state["_single_selection_key"] = single_input_key
+        st.session_state.pop("prog_zip", None)
     if not selected:
         st.warning("Please select at least one programme.")
         return
+    selected = [p for p in programmes if p in selected]   # keep sheet order, not click order
 
     st.markdown("### 📝 Enter Participant Headcount Setup")
-    
+    st.caption("Leave a box empty if you don't know the headcount. The report will then show "
+               "'Not provided' and skip the response rate.")
+
     participants = {}
     totals = {}
 
     for prog in selected:
         prog_df = df[df["Program Name"] == prog]
-        counts = prog_df[prog_df["Faculty Name"].notna()].groupby(["Session", "Faculty Name"]).size()
+        fac_rows = prog_df[prog_df["Faculty Name"].notna()]
+        dept_rows = prog_df[prog_df["Faculty Name"].isna()]
+        fac_counts = fac_rows.groupby(["Session", "Faculty Name"], sort=False).size()
+        dept_counts = dept_rows.groupby("Session", sort=False).size()
+
         st.markdown(f"--- \n#### {prog}")
-        
+
+        # Make it obvious which rows are being treated as department sessions
+        if not dept_rows.empty:
+            names = [str(s) for s in dept_counts.index]
+            shown = ", ".join(names[:8]) + (" …" if len(names) > 8 else "")
+            if fac_rows.empty:
+                st.caption(f"ℹ️ This programme has only department sessions ({len(dept_rows)} rows, no Faculty Name): {shown}.")
+            else:
+                st.caption(f"ℹ️ {len(dept_rows)} of {len(prog_df)} rows have no Faculty Name and are treated as "
+                           f"department sessions: {shown}.")
+
         same_count = st.checkbox(
-            f"Same total participant count for all sessions in **{prog}**", 
-            value=True, 
+            f"Same total participant count for all sessions in **{prog}**",
+            value=True,
             key=f"same_count_{prog}"
         )
-        
+
         if same_count:
-            single_val = st.number_input(
-                f"Participant count for all sessions & overall total in **{prog}**", 
-                value=max(len(prog_df), 25), 
-                step=1, 
-                key=f"single_val_{prog}"
-            )
+            single_val = _count_input(
+                f"Participant count for all sessions & overall total in **{prog}**",
+                f"single_val_{prog}")
             totals[prog] = single_val
-            for (session, faculty), _ in counts.items():
+            for (session, faculty), _ in fac_counts.items():
                 participants[f"{prog} -- {faculty} -- {session}"] = single_val
+            for session in dept_counts.index:
+                participants[f"{prog} -- Dept -- {session}"] = single_val
         else:
             st.markdown("Enter individual class sizes per session:")
             session_vals = []
-            for (session, faculty), n in counts.items():
-                val = st.number_input(
-                    f"Participants for **{session}** ({faculty}) — [{n} responses in file]", 
-                    value=max(int(n), 10), 
-                    step=1, 
-                    key=f"{prog} -- {faculty} -- {session}"
-                )
+            for (session, faculty), n in fac_counts.items():
+                val = _count_input(
+                    f"Participants for **{session}** ({faculty}) — [{n} responses in file]",
+                    f"{prog} -- {faculty} -- {session}")
+                if val is not None and val < n:
+                    st.warning(f"{session} ({faculty}): {n} responses but only {val} participants entered.")
                 participants[f"{prog} -- {faculty} -- {session}"] = val
                 session_vals.append(val)
-            
-            tot_val = st.number_input(
-                f"Total Overall Participants for **{prog}**", 
-                value=max(sum(session_vals), len(prog_df)), 
-                step=1, 
-                key=f"total_{prog}"
-            )
+            for session, n in dept_counts.items():
+                val = _count_input(
+                    f"Participants for **{session}** (Department) — [{n} responses in file]",
+                    f"{prog} -- Dept -- {session}")
+                if val is not None and val < n:
+                    st.warning(f"{session} (Department): {n} responses but only {val} participants entered.")
+                participants[f"{prog} -- Dept -- {session}"] = val
+                session_vals.append(val)
+
+            tot_val = _count_input(
+                f"Total Overall Participants for **{prog}** (empty = sum of the sessions above)",
+                f"total_{prog}")
+            if tot_val is None and session_vals and all(v is not None for v in session_vals):
+                tot_val = sum(session_vals)
             totals[prog] = tot_val
+
+        highest = _max_session_responses(prog_df)
+        if totals[prog] and highest > totals[prog]:
+            st.warning(f"{prog}: the busiest session has {highest} responses but only {totals[prog]} "
+                       f"participants were entered. The response rate will be shown as 100%.")
+
+    missing = [p for p in selected if not totals.get(p)]
+    if missing:
+        st.info("Participants not provided for: " + ", ".join(missing) +
+                ". Their overall report will show the response rate as not available.")
+
+    invalid_headcounts = []
+    for prog in selected:
+        prog_df = df[df["Program Name"] == prog]
+        highest = _max_session_responses(prog_df)
+        total = totals.get(prog)
+        if total is not None and total < highest:
+            invalid_headcounts.append(f"{prog}: {highest} responses but {total} participants")
+    if invalid_headcounts:
+        st.error("Participant count is too low:\n\n- " + "\n- ".join(invalid_headcounts))
 
     st.markdown("---")
     gen_overall = st.checkbox("Generate Overall Programme Report", value=True)
     gen_individual = st.checkbox("Generate Individual Faculty Reports (ZIP)", value=True)
-    
+    add_sign = st.checkbox("Add sign-off block at the end (Name / Title / Sign)", value=True)
+    prog_options_key = repr((selected, participants, totals, gen_overall, gen_individual, add_sign))
+    if st.session_state.get("_prog_options_key") != prog_options_key:
+        st.session_state["_prog_options_key"] = prog_options_key
+        st.session_state.pop("prog_zip", None)
+
     if st.button("🚀 Generate Programme Reports", type="primary"):
         if not (gen_overall or gen_individual):
             st.warning("Tick at least one report type.")
+        elif invalid_headcounts:
+            st.warning("Correct the participant counts before generating reports.")
         else:
-            bar = st.progress(0.0, text="Starting…")
-            data = generate_programme_zip(
-                df, selected, participants, totals, gen_overall, gen_individual, param_cols,
-                on_progress=lambda frac, name: bar.progress(frac, text=f"Finished {name}"),
-            )
-            bar.empty()
-            st.session_state["prog_zip"] = (data, len(selected))
+            try:
+                bar = st.progress(0.0, text="Starting…")
+                data = generate_programme_zip(
+                    df, selected, participants, totals, gen_overall, gen_individual, param_cols,
+                    on_progress=lambda frac, name: bar.progress(frac, text=f"Finished {name}"),
+                    signatory=signatory, include_signoff=add_sign,
+                )
+                bar.empty()
+                st.session_state["prog_zip"] = (data, len(selected))
+            except Exception as exc:
+                st.error(f"Report generation failed: {exc}")
 
     # Result survives the rerun triggered by clicking download
     if "prog_zip" in st.session_state:
@@ -603,19 +1081,83 @@ def single_programme_mode(df, param_cols):
         st.download_button("📥 Download All Reports ZIP", data, file_name="Multiple_Programmes_Reports.zip",
                            mime="application/zip")
 
-def master_mode(df, param_cols):
-    st.markdown("### 🏢 Master Departmental Report (All Programmes Roll-up)")
-    st.markdown("This will aggregate all programmes in the dataset into a comprehensive periodic departmental review.")
+def master_mode(df, param_cols, signatory=None):
+    st.markdown("### 🏢 Master Departmental Report")
+    st.markdown("A short summary for department directors and heads.")
+
+    has_dept = _has_dept(df)
+    if has_dept:
+        departments = df[DEPT_COL].dropna().unique().tolist()   # order of the sheet
+        sel_depts = st.multiselect("Departments:", departments, default=departments)
+        missing = int(df[DEPT_COL].isna().sum())
+        if missing:
+            st.caption(f"{missing} rows have no Department and are left out of this report.")
+        scoped = df[df[DEPT_COL].isin(sel_depts)]
+    else:
+        st.info(f"No '{DEPT_COL}' column found, so programmes can't be grouped by department.")
+        sel_depts, scoped = [], df
+
+    programmes = scoped["Program Name"].dropna().unique().tolist()
+    selected = st.multiselect("Programmes:", programmes, default=programmes)
+    selected = [p for p in programmes if p in selected]
+    master_input_key = repr((sel_depts if has_dept else "all", selected))
+    if st.session_state.get("_master_selection_key") != master_input_key:
+        st.session_state["_master_selection_key"] = master_input_key
+        st.session_state.pop("master_out", None)
+
+    c1, c2 = st.columns(2)
+    rank_n = c1.number_input("Sessions in top / bottom lists", min_value=1, max_value=10, value=3)
+    max_comments = c2.number_input("Max comments per session (0 = all)", min_value=0, max_value=50, value=5)
+    include_support = st.checkbox("Include support services scores (rows with no faculty name)", value=True)
+    include_chart = st.checkbox("Include parameter chart", value=True)
+    add_sign = st.checkbox("Add sign-off block at the end (Name / Title / Sign)", value=False)
+    per_dept = (st.checkbox("One report per department (ZIP)", value=False)
+                if has_dept and len(sel_depts) > 1 else False)
+    master_options_key = repr((selected, sel_depts, rank_n, max_comments,
+                               include_support, include_chart, add_sign, per_dept))
+    if st.session_state.get("_master_options_key") != master_options_key:
+        st.session_state["_master_options_key"] = master_options_key
+        st.session_state.pop("master_out", None)
+
+    if not selected:
+        st.warning("Please select at least one programme.")
+        return
+
     if st.button("🚀 Generate Master Departmental Report", type="primary"):
-        with st.spinner("Compiling departmental report across all programmes..."):
-            st.session_state["dept_docx"] = build_master_report(df, param_cols)
-    if "dept_docx" in st.session_state:
-        st.success("Successfully generated Master Departmental Report!")
-        st.download_button(
-            "📥 Download Master Departmental Report (.docx)", st.session_state["dept_docx"],
-            file_name="Master_Departmental_Evaluation_Report.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
+        sub = scoped[scoped["Program Name"].isin(selected)]
+        opts = dict(rank_n=int(rank_n), max_comments=int(max_comments) or None,
+                    include_support=include_support, include_chart=include_chart,
+                    signatory=signatory if add_sign else None)
+        try:
+            with st.spinner("Compiling report..."):
+                if per_dept:
+                    buf = io.BytesIO()
+                    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                        used = set()
+                        for d in sub[DEPT_COL].dropna().unique():   # sheet order
+                            data = build_master_report(sub[sub[DEPT_COL] == d], param_cols,
+                                                       scope_label=f"Department: {d}", **opts)
+                            zf.writestr(_unique(f"{safe_name(d)}_Master_Report.docx", used), data)
+                    st.session_state["master_out"] = (buf.getvalue(), "zip")
+                else:
+                    label = (f"Department: {', '.join(sel_depts)}"
+                             if 0 < len(sel_depts) <= 3 else None)
+                    st.session_state["master_out"] = (
+                        build_master_report(sub, param_cols, scope_label=label, **opts), "docx")
+        except Exception as exc:
+            st.error(f"Master report generation failed: {exc}")
+
+    if "master_out" in st.session_state:
+        data, kind = st.session_state["master_out"]
+        st.success("Report is ready.")
+        if kind == "zip":
+            st.download_button("📥 Download Department Reports (ZIP)", data,
+                               file_name="Master_Departmental_Reports.zip", mime="application/zip")
+        else:
+            st.download_button(
+                "📥 Download Master Departmental Report (.docx)", data,
+                file_name="Master_Departmental_Evaluation_Report.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
 def main():
     st.set_page_config(page_title="SBS Evaluation Automation", layout="centered", page_icon="📊")
@@ -631,16 +1173,18 @@ def main():
         st.error("No evaluation parameters found in the data. Please ensure there are numeric columns for scoring.")
         return
 
+    signatory = signoff_form()
+
     st.markdown("---")
     scope = st.selectbox("Select Report Generation Mode:", [
         "Single Programme Mode (Individual Faculty & Programme Reports)",
         "Master Departmental Report Mode (Cross-Programme Roll-up)",
     ])
-    
+
     if "Single Programme Mode" in scope:
-        single_programme_mode(df, param_cols)
+        single_programme_mode(df, param_cols, signatory)
     else:
-        master_mode(df, param_cols)
+        master_mode(df, param_cols, signatory)
 
 if __name__ == "__main__":
     main()
