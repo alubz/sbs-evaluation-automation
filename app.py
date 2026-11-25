@@ -156,12 +156,117 @@ def _num(value) -> float:
     except (TypeError, ValueError):
         return 0.0
 
+def _read_in_cell_signatures(workbook_bytes, worksheet_name, signature_col):
+    """Read Excel's newer in-cell images, which openpyxl does not expose as worksheet images."""
+    from posixpath import join, normpath
+    from xml.etree import ElementTree as ET
+    from zipfile import ZipFile
+
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    package_rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    rich_value_rel_ns = "http://schemas.microsoft.com/office/spreadsheetml/2022/richvaluerel"
+    rich_data_ns = "http://schemas.microsoft.com/office/spreadsheetml/2017/richdata"
+
+    with ZipFile(io.BytesIO(workbook_bytes)) as archive:
+        names = set(archive.namelist())
+        required = {
+            "xl/workbook.xml",
+            "xl/_rels/workbook.xml.rels",
+            "xl/metadata.xml",
+            "xl/richData/rdrichvalue.xml",
+            "xl/richData/richValueRel.xml",
+            "xl/richData/_rels/richValueRel.xml.rels",
+        }
+        if not required.issubset(names):
+            return {}
+
+        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        workbook_rels = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        rel_targets = {
+            rel.get("Id"): rel.get("Target")
+            for rel in workbook_rels.findall(f"{{{package_rel_ns}}}Relationship")
+        }
+        sheet = next(
+            (node for node in workbook.findall(f".//{{{main_ns}}}sheet")
+             if node.get("name") == worksheet_name),
+            None,
+        )
+        if sheet is None:
+            return {}
+        sheet_target = rel_targets.get(sheet.get(f"{{{rel_ns}}}id"))
+        if not sheet_target:
+            return {}
+        sheet_path = normpath(sheet_target.lstrip("/")) if sheet_target.startswith("/") else normpath(join("xl", sheet_target))
+        if sheet_path not in names:
+            return {}
+
+        metadata = ET.fromstring(archive.read("xl/metadata.xml"))
+        metadata_blocks = metadata.find(f"{{{main_ns}}}valueMetadata")
+        rich_values = ET.fromstring(archive.read("xl/richData/rdrichvalue.xml"))
+        image_rels = ET.fromstring(archive.read("xl/richData/richValueRel.xml"))
+        rich_rels = ET.fromstring(archive.read("xl/richData/_rels/richValueRel.xml.rels"))
+        if metadata_blocks is None:
+            return {}
+
+        metadata_records = list(metadata_blocks.findall(f"{{{main_ns}}}bk"))
+        value_records = list(rich_values)
+        image_rel_ids = [
+            item.get(f"{{{rel_ns}}}id")
+            for item in image_rels.findall(f"{{{rich_value_rel_ns}}}rel")
+        ]
+        rich_rel_targets = {
+            rel.get("Id"): rel.get("Target")
+            for rel in rich_rels.findall(f"{{{package_rel_ns}}}Relationship")
+        }
+        worksheet = ET.fromstring(archive.read(sheet_path))
+        signatures = {}
+        for cell in worksheet.findall(f".//{{{main_ns}}}c"):
+            reference = cell.get("r", "")
+            cell_match = re.fullmatch(r"([A-Z]+)(\d+)", reference)
+            if not cell_match or cell_match.group(1) != signature_col:
+                continue
+            metadata_index = cell.get("vm")
+            if not metadata_index:
+                continue
+            metadata_index = int(metadata_index) - 1
+            if not 0 <= metadata_index < len(metadata_records):
+                continue
+            rich_ref = metadata_records[metadata_index].find(f".//{{{main_ns}}}rc")
+            if rich_ref is None or rich_ref.get("v") is None:
+                continue
+            value_index = int(rich_ref.get("v"))
+            if not 0 <= value_index < len(value_records):
+                continue
+            image_id = value_records[value_index].find(f"{{{rich_data_ns}}}v")
+            if image_id is None or image_id.text is None:
+                continue
+            image_index = int(image_id.text)
+            if not 0 <= image_index < len(image_rel_ids):
+                continue
+            target = rich_rel_targets.get(image_rel_ids[image_index])
+            if not target:
+                continue
+            image_path = (normpath(target.lstrip("/")) if target.startswith("/")
+                          else normpath(join("xl/richData", target)))
+            if image_path in names:
+                signatures[int(cell_match.group(2))] = archive.read(image_path)
+        return signatures
+
 def read_signoffs(source) -> list:
     """Read the sign-off Excel. Headers in row 1: Name | Position | Sign (one row per person).
-    The Sign cell can hold typed text, or a picture placed on that row."""
+    The Sign cell can hold typed text or a picture placed in the cell or on that row."""
     from openpyxl import load_workbook
+    from openpyxl.utils import get_column_letter
     try:
-        wb = load_workbook(source)
+        if isinstance(source, bytes):
+            workbook_bytes = source
+        elif hasattr(source, "getvalue"):
+            workbook_bytes = source.getvalue()
+        else:
+            with open(source, "rb") as workbook_file:
+                workbook_bytes = workbook_file.read()
+        wb = load_workbook(io.BytesIO(workbook_bytes))
     except Exception as exc:
         raise ValueError("The sign-off file could not be opened as a valid Excel workbook.") from exc
     ws = next((wb[n] for n in wb.sheetnames if n.strip().lower().replace(" ", "").replace("-", "") == "signoff"),
@@ -182,7 +287,7 @@ def read_signoffs(source) -> list:
             cols["h"] = c.column
     if "name" not in cols:
         raise ValueError("Row 1 needs the headers: Name, Position, Sign")
-    # pictures, matched to the row they are placed on
+    # Floating pictures, matched to the row they are placed on.
     pics = {}
     for img in getattr(ws, "_images", []):
         try:
@@ -193,12 +298,18 @@ def read_signoffs(source) -> list:
                 pics.setdefault(row, data)
         except Exception:
             continue
+    if "sign" in cols:
+        pics.update(_read_in_cell_signatures(
+            workbook_bytes, ws.title, get_column_letter(cols["sign"])))
 
     people = []
     for r in range(2, ws.max_row + 1):
         name = str(ws.cell(r, cols["name"]).value or "").strip()
         title = str(ws.cell(r, cols["title"]).value or "").strip() if "title" in cols else ""
-        text = str(ws.cell(r, cols["sign"]).value or "").strip() if "sign" in cols else ""
+        sign_cell = ws.cell(r, cols["sign"]) if "sign" in cols else None
+        text = str(sign_cell.value or "").strip() if sign_cell is not None else ""
+        if sign_cell is not None and sign_cell.data_type == "e":
+            text = ""
         if not (name or title or text or r in pics):
             continue
         people.append(Signatory(
@@ -517,34 +628,22 @@ def add_signature(doc, signatory=None):
     doc.add_paragraph()
     doc.add_heading("SUBMITTED THROUGH:", level=2)
 
-    table = doc.add_table(rows=1, cols=3)
+    table = doc.add_table(rows=3, cols=2)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     table.autofit = False
-    widths = (Inches(2.2), Inches(2.2), Inches(2.2))
-    headers = ("Name", "Title", "Sign")
-    for idx, (cell, width, header) in enumerate(zip(table.rows[0].cells, widths, headers)):
-        cell.width = width
-        set_cell_margins(cell, top=100, bottom=100, start=120, end=120)
-        p = cell.paragraphs[0]
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run(header)
-        run.bold = True
+    widths = (Inches(1.25), Inches(5.25))
+    fields = (("Name", s.name or blank), ("Title", s.title or blank), ("Sign", None))
+    for row, (label, value) in zip(table.rows, fields):
+        label_cell, value_cell = row.cells
+        for cell, width in zip(row.cells, widths):
+            cell.width = width
+            set_cell_margins(cell, top=100, bottom=100, start=120, end=120)
+        label_run = label_cell.paragraphs[0].add_run(label)
+        label_run.bold = True
+        if value is not None:
+            value_cell.paragraphs[0].add_run(value)
 
-    row = table.add_row()
-    name_cell, title_cell, sign_cell = row.cells
-    for cell, width in zip(row.cells, widths):
-        cell.width = width
-        set_cell_margins(cell, top=100, bottom=100, start=120, end=120)
-
-    name_p = name_cell.paragraphs[0]
-    name_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    name_p.add_run(s.name or blank)
-    title_p = title_cell.paragraphs[0]
-    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    title_p.add_run(s.title or blank)
-
-    p = sign_cell.paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p = table.rows[2].cells[1].paragraphs[0]
     placed = False
     if s.signature:
         try:
@@ -574,16 +673,19 @@ def add_faculty_content(doc, fr: FacultyResult, pic_width, comment_level):
     add_comments(doc, fr.comments, comment_level)
 
 # Report builders
-def build_faculty_report(programme, fr: FacultyResult, session_participants, signatory=None,
+def build_faculty_report(programme, faculty_results, session_participants, signatory=None,
                          include_signoff=True) -> bytes:
     doc = new_doc()
     add_title(doc, "FACULTY EVALUATION")
     doc.add_paragraph(f"Programme Name: {programme}")
-    doc.add_paragraph(f"Session: {fr.session}")
-    doc.add_paragraph(f"Faculty Name: {fr.faculty}")
-    doc.add_paragraph(f"No. of Respondents: {fr.respondents}")
-    doc.add_paragraph(f"No. of Participants: {_fmt_count(session_participants)}")
-    add_faculty_content(doc, fr, 6.5, 2)
+    doc.add_paragraph(f"Faculty Name: {faculty_results[0].faculty}")
+    for index, fr in enumerate(faculty_results):
+        if index:
+            doc.add_page_break()
+        doc.add_heading(f"Session: {fr.session}", level=1)
+        doc.add_paragraph(f"No. of Respondents: {fr.respondents}")
+        doc.add_paragraph(f"No. of Participants: {_fmt_count(session_participants.get(fr.session))}")
+        add_faculty_content(doc, fr, 6.5, 2)
     if include_signoff:
         add_signature(doc, signatory)
     return doc_to_bytes(doc)
@@ -789,7 +891,8 @@ def build_master_report(df, param_cols, rank_n=RANK_N, max_comments=MAX_COMMENTS
 
 # Batch generation (in-memory, guaranteed valid ZIP structure)
 def generate_programme_zip(df, programmes, participants, totals, gen_overall, gen_individual,
-                           param_cols, on_progress=None, signatory=None, include_signoff=True) -> bytes:
+                           param_cols, on_progress=None, signatory=None, include_signoff=True,
+                           combine_faculty_sessions=True) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         used_folders = set()
@@ -811,11 +914,20 @@ def generate_programme_zip(df, programmes, participants, totals, gen_overall, ge
 
             if gen_individual:
                 used_files = set()
+                faculty_sessions = {}
                 for fr in res.faculty:
-                    key = f"{prog} -- {fr.faculty} -- {fr.session}"
-                    session_headcount = participants.get(key)
-                    data = build_faculty_report(prog, fr, session_headcount, signatory, include_signoff)
-                    fname = _unique(f"{safe_name(fr.faculty)}_{safe_name(fr.session)}.docx", used_files)
+                    faculty_sessions.setdefault(fr.faculty, []).append(fr)
+                report_groups = (faculty_sessions.items() if combine_faculty_sessions else
+                                 ((fr.faculty, [fr]) for fr in res.faculty))
+                for faculty, session_results in report_groups:
+                    session_headcounts = {
+                        fr.session: participants.get(f"{prog} -- {faculty} -- {fr.session}")
+                        for fr in session_results
+                    }
+                    data = build_faculty_report(
+                        prog, session_results, session_headcounts, signatory, include_signoff)
+                    suffix = "" if combine_faculty_sessions else f"_{safe_name(session_results[0].session)}"
+                    fname = _unique(f"{safe_name(faculty)}{suffix}.docx", used_files)
                     zf.writestr(f"{folder}/Faculty_Reports/{fname}", data)
 
             if gen_overall:
@@ -923,19 +1035,25 @@ def signoff_form() -> Signatory:
                            file_name="signoff.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        chosen = Signatory()
-        if people:
-            labels = {i: f"{p.name} — {p.title}".strip(" —") for i, p in enumerate(people)}
-            labels[-1] = "No one (leave blank to sign by hand)"
-            pick = st.selectbox("Who signs these reports?", [-1] + list(range(len(people))),
-                                index=1, format_func=lambda i: labels[i], key="so_pick")
-            if pick >= 0:
-                chosen = people[pick]
-                how = "signature image" if chosen.signature else ("typed signature" if chosen.sign_text else "blank line")
-                st.caption(f"Sign: {how}")
-                signoff_fingerprint += f":{pick}"
-            else:
-                signoff_fingerprint += ":none"
+    chosen = Signatory()
+    if people:
+        people_key = tuple((p.name, p.title) for p in people)
+        if st.session_state.get("_so_people_key") != people_key:
+            st.session_state.pop("so_pick", None)
+            st.session_state["_so_people_key"] = people_key
+        labels = {i: f"{p.name} — {p.title}".strip(" —") for i, p in enumerate(people)}
+        labels[-1] = "No one (leave blank to sign by hand)"
+        pick = st.selectbox("Select the signatory for generated reports", [-1] + list(range(len(people))),
+                            index=1, format_func=lambda i: labels[i], key="so_pick")
+        if pick >= 0:
+            chosen = people[pick]
+            how = "signature image" if chosen.signature else ("typed signature" if chosen.sign_text else "blank line")
+            st.caption(f"Sign: {how}")
+            signoff_fingerprint += f":{pick}"
+        else:
+            signoff_fingerprint += ":none"
+    else:
+        st.caption("No signatories are available. Upload a sign-off Excel file or add entries to signoff.xlsx.")
     if st.session_state.get("_signoff_fingerprint") != signoff_fingerprint:
         st.session_state["_signoff_fingerprint"] = signoff_fingerprint
         st.session_state.pop("prog_zip", None)
@@ -1050,8 +1168,15 @@ def single_programme_mode(df, param_cols, signatory=None):
     st.markdown("---")
     gen_overall = st.checkbox("Generate Overall Programme Report", value=True)
     gen_individual = st.checkbox("Generate Individual Faculty Reports (ZIP)", value=True)
+    combine_faculty_sessions = st.checkbox(
+        "Combine each faculty's sessions into one report",
+        value=True,
+        disabled=not gen_individual,
+        help="Each session stays in its own section. Uncheck to create a separate file for each session.",
+    )
     add_sign = st.checkbox("Add sign-off block at the end (Name / Title / Sign)", value=True)
-    prog_options_key = repr((selected, participants, totals, gen_overall, gen_individual, add_sign))
+    prog_options_key = repr((
+        selected, participants, totals, gen_overall, gen_individual, combine_faculty_sessions, add_sign))
     if st.session_state.get("_prog_options_key") != prog_options_key:
         st.session_state["_prog_options_key"] = prog_options_key
         st.session_state.pop("prog_zip", None)
@@ -1068,6 +1193,7 @@ def single_programme_mode(df, param_cols, signatory=None):
                     df, selected, participants, totals, gen_overall, gen_individual, param_cols,
                     on_progress=lambda frac, name: bar.progress(frac, text=f"Finished {name}"),
                     signatory=signatory, include_signoff=add_sign,
+                    combine_faculty_sessions=combine_faculty_sessions,
                 )
                 bar.empty()
                 st.session_state["prog_zip"] = (data, len(selected))
